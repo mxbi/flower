@@ -37,6 +37,7 @@ from flwr.common.logger import log
 from flwr.server.client_manager import ClientManager
 from flwr.server.client_proxy import ClientProxy
 import random
+import numpy as np
 
 from .aggregate import aggregate, weighted_loss_avg
 from .strategy import Strategy
@@ -56,7 +57,6 @@ def aggregate_gossip(
     """Create a new set of parameters per client.
     Each client gets averaged with a fraction of the other clients, randomly
     """
-    # TODO: Sort out the edge cases when not all clients participate
     aggregated_params: Dict[str, Parameters] = {}
 
     inputs = [
@@ -74,14 +74,105 @@ def aggregate_gossip(
         # gossip_clients = gossip_clients[np.random.choice(np.arange(len(gossip_clients)), int(fraction_gossip * len(gossip_clients)), replace=False)] #
 
         # Aggregate with gossip clients
-        communication_cost += len(str([(client[1], client[2]) for client in gossip_clients])) # Get size of message (approximately)
+        # communication_cost += len(str([(client[1], client[2]) for client in gossip_clients])) 
         gossip_params = [(params, n)] + [(client[1], client[2]) for client in gossip_clients]
         aggregated_params[cid] = ndarrays_to_parameters(
             aggregate(gossip_params)
         )
+        communication_cost += len(aggregated_params[cid]) * gossip_count # Get size of message (approximately)
 
     return aggregated_params, communication_cost
 
+def aggregate_gossip_segmented(
+    results: List[Tuple[ClientProxy, FitRes]],
+    gossip_count: float,
+    segments: int) -> Dict[str, Parameters]:
+    """Create a new set of parameters per client.
+    Each client gets averaged with a fraction of the other clients, randomly
+    The gossip protocol is run separately for each segment of the model weights
+    """
+
+    # Split each client's parameters into segments
+    # Because the parameters are made up of several ndarrays of different shapes, we need to keep track of the shapes
+
+    # 1. Turn each client's parameters into a single flat ndarray, and store a list of the shapes of each ndarray
+    inputs = []
+    for client, fit_res in results:
+        params = parameters_to_ndarrays(fit_res.parameters)
+        shapes = [param.shape for param in params]
+        flat_params = np.concatenate([param.flatten() for param in params])
+        param_size = flat_params.shape[0]
+        inputs.append((client.cid, flat_params, fit_res.num_examples))
+
+    segment_size = param_size // segments
+
+    for cid, params, n in inputs:
+        for i in range(segments):
+            segment_start = i * segment_size
+            segment_end = segment_start + segment_size
+            if i == segments - 1:
+                segment_end = param_size
+
+            # Randomly sample other clients to gossip with for THIS segment
+            gossip_clients = [client for client in inputs if client[0] != cid]
+            gossip_clients = random.sample(gossip_clients, gossip_count)
+
+            params[segment_start:segment_end] = aggregate([(params[segment_start:segment_end], n)] + [(client[1][segment_start:segment_end], client[2]) for client in gossip_clients])
+
+    # Transform each clients parameters back into a list of ndarrays following shapes
+    aggregated_params: Dict[str, Parameters] = {}
+    shape_offsets = [0]
+    offset = 0
+    for shape in shapes:
+        offset += np.prod(shape)
+        shape_offsets.append(offset)
+
+    communication_cost = 0
+    for cid, params, _ in inputs:
+        params = ndarrays_to_parameters(
+            [params[shape_offsets[i]:shape_offsets[i+1]].reshape(shapes[i]) for i in range(len(shapes))]
+        )
+        aggregated_params[cid] = params
+        communication_cost += len(aggregated_params[cid]) * gossip_count
+
+    return aggregated_params, communication_cost
+
+def aggregate_gossip_pga(
+    client_dict: Dict[str, Parameters],
+    client_data_counts: Dict[str, int]):
+    """Create an 
+    """
+    params = [(parameters_to_ndarrays(client_dict[cid]), client_data_counts[cid]) for cid in client_dict if client_data_counts.get(cid)]
+    total_communication = sum([len(client_dict[cid]) for cid in client_dict if client_data_counts.get(cid)]) * len(client_dict)
+
+    return ndarrays_to_parameters(aggregate(params)), total_communication
+
+
+    # # TODO: Sort out the edge cases when not all clients participate
+    # aggregated_params: Dict[str, Parameters] = {}
+
+    # inputs = [
+    #     (client.cid, parameters_to_ndarrays(fit_res.parameters), fit_res.num_examples)
+    #     for client, fit_res in results
+    # ]
+
+    # communication_cost = 0
+    # for cid, params, n in inputs:
+    #     # Randomly sample other clients to gossip with
+    #     gossip_clients = [client for client in inputs if client[0] != cid]
+    #     gossip_clients = random.sample(gossip_clients, gossip_count)
+
+
+    #     # gossip_clients = gossip_clients[np.random.choice(np.arange(len(gossip_clients)), int(fraction_gossip * len(gossip_clients)), replace=False)] #
+
+    #     # Aggregate with gossip clients
+    #     communication_cost += len(str([(client[1], client[2]) for client in gossip_clients])) # Get size of message (approximately)
+    #     gossip_params = [(params, n)] + [(client[1], client[2]) for client in gossip_clients]
+    #     aggregated_params[cid] = ndarrays_to_parameters(
+    #         aggregate(gossip_params)
+    #     )
+
+    # return aggregated_params, communication_cost
 
 
 # flake8: noqa: E501
@@ -93,7 +184,7 @@ class GossipAvg(FedAvg):
         self,
         *,
         gossip_count: int=1,
-        global_update_frequency: int=0, # TODO
+        pga_frequency: int=0, # TODO
         gossip_segments: int=1, # TODO
 
         fraction_fit: float = 1.0,
@@ -158,6 +249,9 @@ class GossipAvg(FedAvg):
             log(WARNING, WARNING_MIN_AVAILABLE_CLIENTS_TOO_LOW)
 
         self.gossip_count = gossip_count
+        self.pga_frequency = pga_frequency
+        self.gossip_segments = gossip_segments
+
         self.fraction_fit = fraction_fit
         self.fraction_evaluate = fraction_evaluate
         self.min_fit_clients = min_fit_clients
@@ -172,6 +266,7 @@ class GossipAvg(FedAvg):
         self.evaluate_metrics_aggregation_fn = evaluate_metrics_aggregation_fn
 
         self.preserved_clients = {} # Even when clients don't participate in a round, we want to preserve their parameters
+        self.client_data_counts = {} # Keep track of how many data points each client has for weighting
 
     def __repr__(self) -> str:
         rep = f"GossipAvg(gossip_count={self.gossip_count})"
@@ -240,6 +335,11 @@ class GossipAvg(FedAvg):
             config = self.on_evaluate_config_fn(server_round)
         # evaluate_ins = EvaluateIns(parameters, config)
 
+        if isinstance(parameters, Parameters):
+            print("[GossipAvg] Received initial parameters from server, using these on all clients.")
+            self.initial_parameters = parameters
+            parameters = {}
+
         # Unfreeze clients which didn't participate in the last round
         for cid, params in self.preserved_clients.items():
             if cid not in parameters:
@@ -276,14 +376,33 @@ class GossipAvg(FedAvg):
         #     for _, fit_res in results
         # ]
 
+        for client, fit_res in results:
+            self.client_data_counts[client.cid] = fit_res.num_examples
+
         # aggregate_gossip goes from List[(ClientProxy, FitRes)] -> Dict[cid, params] (aggregated)
         print('[GossipAvg] Aggregating fit results, received {} results'.format(len(results)))
-        parameters_dict, communication_cost = aggregate_gossip(results, gossip_count=self.gossip_count)
-        print('[GossipAvg] Aggregated fit results, have {} weights. Total communication cost={}'.format(len(parameters_dict), communication_cost))
+        if self.pga_frequency > 0 and server_round % self.pga_frequency == 0:
+            print('[GossipAvg] Performing GLOBAL average'.format(len(results)))
+            for client, fit_res in results:
+                self.preserved_clients[client.cid] = fit_res.parameters
 
-        # Preserve client params where necessary
-        for cid, params in parameters_dict.items():
-            self.preserved_clients[cid] = params
+            parameters_dict, communication_cost = aggregate_gossip_pga(self.preserved_clients, self.client_data_counts)
+
+            # Reset preserved clients - this will cause all clients to load the global model on the next round
+            self.preserved_clients = {}
+            # We will return just a single set of Parameters, which will be set as the default on next iter.
+        else:
+            if self.gossip_segments > 1:
+                parameters_dict, communication_cost = aggregate_gossip_segmented(results, gossip_count=self.gossip_count, segments=self.gossip_segments)
+            else:
+                parameters_dict, communication_cost = aggregate_gossip(results, gossip_count=self.gossip_count)
+
+            # Preserve client params where necessary
+            for cid, params in parameters_dict.items():
+                self.preserved_clients[cid] = params
+
+        # parameters_dict, communication_cost = aggregate_gossip_full(results, self.preserved_clients, self.client_data_counts, gossip_count=self.gossip_count)
+        print('[GossipAvg] Aggregated fit results, have {} weights. Total communication cost={}'.format(len(parameters_dict) if hasattr(parameters_dict, 'len') else 'GLOBAL', communication_cost))
 
         # Aggregate custom metrics if aggregation fn was provided
         metrics_aggregated = {}

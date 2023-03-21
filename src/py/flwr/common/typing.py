@@ -62,6 +62,10 @@ class Parameters:
     tensors: List[bytes]
     tensor_type: str
 
+    def __len__(self) -> int:
+        """Return the total size of all tensors in bytes."""
+        return sum([len(t) for t in self.tensors])
+
 
 @dataclass
 class GetParametersIns:
