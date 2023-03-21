@@ -27,6 +27,7 @@ from .fedprox import FedProx as FedProx
 from .fedxgb_nn_avg import FedXgbNnAvg as FedXgbNnAvg
 from .fedyogi import FedYogi as FedYogi
 from .qfedavg import QFedAvg as QFedAvg
+from .gossip import GossipAvg
 from .strategy import Strategy as Strategy
 
 __all__ = [
