@@ -402,7 +402,7 @@ class GossipAvg(FedAvg):
                 self.preserved_clients[cid] = params
 
         # parameters_dict, communication_cost = aggregate_gossip_full(results, self.preserved_clients, self.client_data_counts, gossip_count=self.gossip_count)
-        print('[GossipAvg] Aggregated fit results, have {} weights. Total communication cost={}'.format(len(parameters_dict) if hasattr(parameters_dict, 'len') else 'GLOBAL', communication_cost))
+        print('[GossipAvg] Aggregated fit results, have {} weights. Total communication cost={}'.format(len(parameters_dict) if isinstance(parameters_dict, dict) else 'GLOBAL', communication_cost))
 
         # Aggregate custom metrics if aggregation fn was provided
         metrics_aggregated = {}
