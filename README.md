@@ -1,3 +1,22 @@
+# Fully Decentralised Federated Learning in Flower
+
+This repository contains an experimental implementation of various gossip learning algorithms built on top of Flower.
+
+The `src/py/flwr/server/strategy/gossip.py` file contains an implementation of the new `GossipAvg` strategy:
+
+```python
+strategy = flwr.server.strategy.GossipAvg(
+    gossip_count: int=1,     # Number of neighbours that each client gossips with after training
+    gossip_segments: int=1,  # Number of segments in the model: each segment gossiped separately (Gossip-SGA)
+    pga_frequency: int=0,    # Frequency of Periodic Global Averaging across all clients (Gossip-PGA)
+    
+    fit_fraction: float=0.1, # Proportion of clients training simultaneously
+    ... # Other parameters same as FedAvg
+    )
+```
+
+Code for experiments on a federated CIFAR-10 dataset can be found in `gossip_experiments/`
+
 # Flower: A Friendly Federated Learning Framework
 
 <p align="center">
